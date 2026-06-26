@@ -235,29 +235,54 @@ def _unique_path(folder: Path, filename: str) -> Path:
 
 
 def download_item(token: str, item: dict, folder: Path) -> Path:
-    meta_resp = _get(token, f"{GRAPH}/me/drive/items/{item['id']}")
-    meta_resp.raise_for_status()
-    meta = meta_resp.json()
+    """Download with automatic retry — re-fetches a fresh URL on each attempt."""
+    last_error = None
 
-    download_url = meta.get("@microsoft.graph.downloadUrl")
-    if not download_url:
-        log.debug(f"No direct URL for {item['name']}, falling back to /content endpoint")
-        resp = _get(token, f"{GRAPH}/me/drive/items/{item['id']}/content", stream=True)
-        resp.raise_for_status()
-    else:
-        resp = requests.get(download_url, stream=True, timeout=120)
-        resp.raise_for_status()
+    for attempt in range(1, 6):  # up to 5 attempts
+        try:
+            # Always fetch a fresh pre-signed URL — old ones expire in ~15-30 min
+            meta_resp = _get(token, f"{GRAPH}/me/drive/items/{item['id']}")
+            meta_resp.raise_for_status()
+            meta = meta_resp.json()
 
-    dest = _unique_path(folder, item["name"])
-    with open(dest, "wb") as fh:
-        for chunk in resp.iter_content(chunk_size=512 * 1024):
-            fh.write(chunk)
+            download_url = meta.get("@microsoft.graph.downloadUrl")
+            if not download_url:
+                log.debug(f"No direct URL for {item['name']}, falling back to /content")
+                resp = _get(token, f"{GRAPH}/me/drive/items/{item['id']}/content", stream=True)
+                resp.raise_for_status()
+            else:
+                resp = requests.get(download_url, stream=True, timeout=120)
+                resp.raise_for_status()
 
-    if dest.stat().st_size == 0:
-        dest.unlink()
-        raise RuntimeError("Downloaded file is empty — skipping.")
+            dest = _unique_path(folder, item["name"])
+            with open(dest, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=512 * 1024):
+                    fh.write(chunk)
 
-    return dest
+            if dest.stat().st_size == 0:
+                dest.unlink()
+                raise RuntimeError("Downloaded file is empty.")
+
+            if attempt > 1:
+                log.info(f"  ✓ Succeeded on attempt {attempt}: {item['name']}")
+
+            return dest  # ← success, exit retry loop
+
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.Timeout,
+            ConnectionResetError,
+        ) as e:
+            last_error = e
+            wait = 2 ** attempt  # 2s, 4s, 8s, 16s, 32s
+            log.warning(
+                f"  ⚠️  Network error on attempt {attempt}/5 for {item['name']} — "
+                f"retrying in {wait}s…\n     ({type(e).__name__}: {e})"
+            )
+            time.sleep(wait)
+
+    raise RuntimeError(f"Failed after 5 attempts: {last_error}")
 
 
 # ══════════════════════════════════════════
