@@ -77,35 +77,35 @@ log = logging.getLogger(__name__)
 #   AUTHENTICATION
 # ══════════════════════════════════════════
 
+_msal_app = None
+
 def acquire_token() -> str:
-    """Authenticate via Device Code Flow (no browser pop-ups needed)."""
+    global _msal_app
     cache = msal.SerializableTokenCache()
     if os.path.exists(TOKEN_CACHE):
         cache.deserialize(Path(TOKEN_CACHE).read_text(encoding="utf-8"))
 
-    app = msal.PublicClientApplication(
-    CLIENT_ID,
-    authority="https://login.microsoftonline.com/consumers",
-    token_cache=cache,
-)
-    accounts = app.get_accounts()
+    _msal_app = msal.PublicClientApplication(       # ← assign to global
+        CLIENT_ID,
+        authority="https://login.microsoftonline.com/consumers",
+        token_cache=cache,
+    )
+    accounts = _msal_app.get_accounts()
     result = None
 
-    # Try silent refresh first
     if accounts:
         log.info(f"Reusing cached session for: {accounts[0]['username']}")
-        result = app.acquire_token_silent(SCOPES, account=accounts[0])
+        result = _msal_app.acquire_token_silent(SCOPES, account=accounts[0])
 
-    # Fall back to device code flow
     if not result:
         log.info("Starting interactive login (device code)…")
-        flow = app.initiate_device_flow(scopes=SCOPES)
+        flow = _msal_app.initiate_device_flow(scopes=SCOPES)
         if "message" not in flow:
             raise RuntimeError(f"Could not start device flow: {flow}")
         print("\n" + "─" * 62)
         print(flow["message"])
         print("─" * 62 + "\n")
-        result = app.acquire_token_by_device_flow(flow)
+        result = _msal_app.acquire_token_by_device_flow(flow)
 
     if "access_token" not in result:
         err = result.get("error_description", result.get("error", "unknown"))
@@ -115,6 +115,26 @@ def acquire_token() -> str:
     log.info("✓ Authenticated successfully.")
     return result["access_token"]
 
+def get_fresh_token() -> str:
+    """
+    Silently refresh the access token using cached credentials.
+    MSAL checks expiry locally — only makes a network call if token is actually expired.
+    No login prompt needed.
+    """
+    global _msal_app
+    accounts = _msal_app.get_accounts()
+    if not accounts:
+        raise RuntimeError("No cached account — please restart the script to log in again.")
+
+    result = _msal_app.acquire_token_silent(SCOPES, account=accounts[0])
+    if not result or "access_token" not in result:
+        raise RuntimeError("Silent token refresh failed — please restart the script.")
+
+    # Persist the refreshed token to cache
+    cache = _msal_app.token_cache
+    Path(TOKEN_CACHE).write_text(cache.serialize(), encoding="utf-8")
+
+    return result["access_token"]
 
 # ══════════════════════════════════════════
 #   GRAPH API HELPERS
@@ -130,8 +150,6 @@ def _get(token: str, url: str, stream: bool = False) -> requests.Response:
             log.warning(f"Rate-limited — waiting {wait}s before retry {attempt + 1}/6…")
             time.sleep(wait)
             continue
-        if resp.status_code == 401:
-            raise RuntimeError("Access token expired mid-run. Please restart the script.")
         return resp
     raise RuntimeError("Exceeded retry limit due to rate limiting.")
 
@@ -410,6 +428,7 @@ def main():
     ok = fail = deleted = 0
 
     for item in tqdm(all_photos, desc="Importing", unit="photo", ncols=80):
+        token = get_fresh_token()   # ← silently refresh before each photo
         name = item["name"]
         size_mb = item.get("size", 0) / 1_000_000
         log.debug(f"Processing: {name}  ({size_mb:.1f} MB)")
